@@ -30,7 +30,6 @@ Prepare datasets in the following structure:
 Datasets-root/
 ├── DanceTrack/
 │   ├── train/
-│   ├── val/
 │   └── test/
 ```
 
