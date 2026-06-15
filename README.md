@@ -22,21 +22,6 @@ pip install mamba-ssm
 
 ---
 
-## Dataset Preparation
-
-Prepare datasets in the following structure:
-
-```text
-Datasets-root/
-├── DanceTrack/
-│   ├── train/
-│   └── test/
-```
-
-Modify the dataset path in commands below.
-
----
-
 ## Training
 
 Launch distributed training:
