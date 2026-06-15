@@ -91,14 +91,3 @@ python main.py \
 
 ---
 
-## Example Directory
-
-```text
-Wave-MambaTrack/
-├── configs/
-├── datasets/
-├── outputs/
-├── main.py
-├── requirements.txt
-└── README.md
-```
