@@ -12,10 +12,14 @@ Create the environment and install dependencies:
 conda create -n wavemambatrack python=3.10
 conda activate wavemambatrack
 
-pip install -r requirements.txt
+conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cuda=11.7 -c pytorch -c nvidia
+conda install matplotlib pyyaml scipy tqdm tensorboard
+
+pip install opencv-python
+cd ./models/ops/
+sh make.sh
 
 Install Mamba State Space Model (mamba-ssm):
-
 pip install causal-conv1d
 pip install mamba-ssm
 ```
