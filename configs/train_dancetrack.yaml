@@ -1,61 +1,65 @@
-# @Author       : Ruopeng Gao
-# @Description  : Config for training DanceTrack.
-#                 We change some parameters compared with our paper, looking forward more stable training convergence.
+# @Author       : LinMingRun
+# @Description  : MeMOTR Config optimized for Underwater Fish Tracking (High Occlusion/Similarity)
+GIT_VERSION: "custom_fish_v1"
+# =================================================
 
-GIT_VERSION:
-
+# 基础运行环境
+# =================================================
 MODE: train
 CONFIG_PATH:
 VISUALIZE: False
-AVAILABLE_GPUS: 0,1,2,3,4,5,6,7
+AVAILABLE_GPUS: '0,1'  # 使用你的8张卡
 DEVICE: cuda
-OUTPUTS_DIR: ./outputs/pycharm/
-USE_DISTRIBUTED: False
+OUTPUTS_DIR: ./output/memotr_fish_final_run1/  # 新的输出目录，避免混淆
+USE_DISTRIBUTED: True            # [修改] 开启分布式训练，利用8卡优势
 USE_CHECKPOINT: False
-CHECKPOINT_LEVEL: 2               # gradient checkpoint level.
-                                  # As the number increases (from 1 to 4), the memory cost increases.
-                                  # We have deleted many comments in this official code simplicity,
-                                  # if you have any questions, feel free to contact with the author.
-RESUME:
-RESUME_SCHEDULER: True
+CHECKPOINT_LEVEL: 2
+RESUME:        # 如果中途断了，填入 checkpoint.pth 路径
+RESUME_SCHEDULER: True           # 恢复训练时记得改为 True
 MULTI_CHECKPOINT: False
 
-# About submit
+# =================================================
+# 核心策略：解决“脸盲”与“跟丢”
+# =================================================
 SUBMIT_DIR:
 SUBMIT_MODEL:
 SUBMIT_DATA_SPLIT: test
-DET_SCORE_THRESH: 0.5
-TRACK_SCORE_THRESH: 0.5
-RESULT_SCORE_THRESH: 0.5
-MISS_TOLERANCE: 30
-USE_MOTION: False
+DET_SCORE_THRESH: 0.7      # 提到 0.8，杀掉更多误报  0.75 0.6 0.4 0.3
+TRACK_SCORE_THRESH: 0.6    # 提到 0.6，只保留稳的轨迹
+RESULT_SCORE_THRESH: 0.3   # [关键] 提到 0.8, 必须和 DET_SCORE_THRESH 保持一致或更高！
+MISS_TOLERANCE: 30               # [修改] 允许鱼消失30帧（约1秒）不删ID
+USE_MOTION: True                 # [核心] 必须开启运动模型
 MOTION_MIN_LENGTH: 3
 MOTION_MAX_LENGTH: 5
-MOTION_LAMBDA: 0.5
+MOTION_LAMBDA: 0.3               # [核心] 这里的权重很高，强迫模型依赖运动预测
 
-# About Evaluation
+
 EVAL_DIR:
-EVAL_MODE: specific               # specific/continue
+EVAL_MODE: specific
 EVAL_MODEL:
 EVAL_PORT:
 EVAL_THREADS: 1
-EVAL_DATA_SPLIT: val
+EVAL_DATA_SPLIT: test
+DATASET: DanceTrack              # 对应我们修改过代码的 Dataset Class
+USE_MOTSYNTH: False
+USE_CROWDHUMAN: False
+MOTSYNTH_RATE: 0.0
 
-# About data processing
-DATASET: DanceTrack
-USE_MOTSYNTH:
-USE_CROWDHUMAN:
-MOTSYNTH_RATE:
-DATA_ROOT:
+#DATA_ROOT
+DATA_ROOT: /home/LiaoYangHao/LinMingRun/MeMOTR  # 你的根目录
 DATA_PATH:
-NUM_WORKERS: 4
-BATCH_SIZE: 1
-ACCUMULATION_STEPS: 1
-COCO_SIZE: False
+
+
+NUM_WORKERS: 4                   # 8卡x4workers = 32线程，注意CPU负载
+BATCH_SIZE: 1                    # 8卡x1batch = 总Batch 8 (显存够的话可以改2)
+ACCUMULATION_STEPS: 8
+COCO_SIZE: False                 # 鱼较小，不要强行压缩尺寸
 OVERFLOW_BBOX: False
 REVERSE_CLIP: 0.0
 
-# About model
+# =================================================
+# 模型结构
+# =================================================
 BACKBONE: resnet50
 HIDDEN_DIM: 256
 FFN_DIM: 2048
@@ -73,8 +77,9 @@ AUX_LOSS: True
 USE_DAB: True
 UPDATE_THRESH: 0.5
 LONG_MEMORY_LAMBDA: 0.01
-# Pretrain model
-PRETRAINED_MODEL: dab_deformable_detr.pth
+
+# 预训练权重：使用 DanceTrack 的权重作为起点
+PRETRAINED_MODEL: '/nfs_B/LiaoYangHao/MeMOTR_output/memotr_dancetrack/checkpoint_119.pth'
 
 # Sampling setting
 SAMPLE_STEPS: [6, 10, 14]
@@ -82,30 +87,41 @@ SAMPLE_LENGTHS: [2, 3, 4, 5]
 SAMPLE_MODES: [random_interval]
 SAMPLE_INTERVALS: [10]
 
-# Training setting
-SEED: 42
-EPOCHS: 20
-ONLY_TRAIN_QUERY_UPDATER_AFTER: 20
-DROPOUT: 0.0
-NUM_DET_QUERIES: 300
-# training augmentation
+# =================================================
+# 训练参数
+# =================================================
+
+SEED: 45                        #42 123 3407 2024 6666
+EPOCHS: 20                      # [建议] 跑60轮，保证充分收敛
+ONLY_TRAIN_QUERY_UPDATER_AFTER: 60
+DROPOUT: 0.1                     # [核心] 防止 Loss 虚低
+NUM_DET_QUERIES: 300             # 如果鱼群非常密集(>100条/帧)，建议改为 500
 TP_DROP_RATE: 0.0
 FP_INSERT_RATE: 0.0
+
+# 优化器
+
 LR: 2.0e-4
 LR_BACKBONE: 2.0e-5
 LR_POINTS: 1.0e-5
-WEIGHT_DECAY: 0.0005
+WEIGHT_DECAY: 0.0002
 CLIP_MAX_NORM: 0.1
 LR_SCHEDULER: MultiStep
 LR_DROP_RATE: 0.1
-LR_DROP_MILESTONES: [12]
-# DETR matcher
+LR_DROP_MILESTONES: [30, 50]     # [关键] 在第40轮和50轮降低学习率，这是Loss下降的关键点
+
+# =================================================
+# Loss 权重 (强调位置准确性)
+# =================================================
+
 MATCH_COST_CLASS: 2
-MATCH_COST_BBOX: 5
-MATCH_COST_GIOU: 2
-# DETR loss
+MATCH_COST_BBOX: 10              # [核心] 提高 Box 权重，强迫框准
+MATCH_COST_GIOU: 5               # [核心] 提高 GIOU 权重
+
 LOSS_WEIGHT_FOCAL: 2
 LOSS_WEIGHT_L1: 5
 LOSS_WEIGHT_GIOU: 2
-# Aux Loss Weight
 AUX_LOSS_WEIGHT: [1.0, 1.0, 1.0, 1.0, 1.0]
+
+# [新增] Bio-Motion Loss 权重
+LOSS_WEIGHT_BIO: 1   #消融实验记得改回来 20

@@ -7,11 +7,9 @@ from random import randint
 import torch
 from PIL import Image
 import data.transforms as T
-# from typing import List
-# from torch.utils.data import Dataset
 from .mot import MOTDataset
 from collections import defaultdict
-
+from typing import List  # 必须导入 List
 import matplotlib.pyplot as plt
 from torchvision.transforms import ToPILImage
 
@@ -45,14 +43,45 @@ class DanceTrack(MOTDataset):
 
         for vid in os.listdir(self.split_dir):
             gt_path = os.path.join(self.split_dir, vid, "gt", "gt.txt")
+            
+            # --- [修复核心] 兼容性更强的数据读取逻辑 ---
+            if not os.path.exists(gt_path):
+                print(f"Warning: GT file not found: {gt_path}")
+                continue
+
             for line in open(gt_path):
-                # gt per line: <frame>, <id>, <bb_left>, <bb_top>, <bb_width>, <bb_height>, 1, 1, 1
-                # https://github.com/DanceTrack/DanceTrack
-                t, i, *xywh, a, b, c = line.strip().split(",")[:9]
-                t, i, a, b, c = map(int, (t, i, a, b, c))
-                x, y, w, h = map(float, xywh)
-                assert a == b == c == 1, f"Check Digit ERROR!"
-                self.gts[vid][t].append([i, x, y, w, h])
+                line = line.strip()
+                if not line: continue
+
+                # 1. 自动判断分隔符 (空格或逗号)
+                if "," in line:
+                    parts = line.split(",")
+                else:
+                    parts = line.split()
+                
+                # 2. 确保至少有6列数据 (frame, id, x, y, w, h)
+                if len(parts) < 6:
+                    continue
+
+                try:
+                    # 3. 解析基础数据 (使用 float 转换坐标，防止 '12.0' 报错)
+                    t = int(float(parts[0]))  # 先转float再转int，兼容 '1.0'
+                    i = int(float(parts[1]))
+                    x = float(parts[2])
+                    y = float(parts[3])
+                    w = float(parts[4])
+                    h = float(parts[5])
+
+                    # 4. 修正帧号：如果从0开始，强制+1以适应MeMOTR
+                    if t == 0:
+                        t = 1
+                    
+                    # 5. 存入字典
+                    self.gts[vid][t].append([i, x, y, w, h])
+                except ValueError as e:
+                    print(f"Warning: Skipping invalid line: {line} | Error: {e}")
+                    continue
+            # --- [修复结束] ---
 
         vids = list(self.gts.keys())
 
@@ -79,7 +108,8 @@ class DanceTrack(MOTDataset):
         assert self.sample_begin_frames is not None, "Please use set_epoch to init DanceTrack Dataset."
         return len(self.sample_begin_frames)
 
-    def sample_frames_idx(self, vid: int, begin_frame: int) -> list[int]:
+    # [修复] 这里 list[int] 改为了 List[int]
+    def sample_frames_idx(self, vid: int, begin_frame: int) -> List[int]:
         if self.sample_mode == "random_interval":
             assert self.sample_length > 1, "Sample length is less than 2."
             remain_frames = self.sample_vid_tmax[vid] - begin_frame
@@ -102,6 +132,11 @@ class DanceTrack(MOTDataset):
         self.sample_mode = self.sample_modes[min(len(self.sample_modes) - 1, self.sample_stage)]
         self.sample_interval = self.sample_intervals[min(len(self.sample_intervals) - 1, self.sample_stage)]
         for vid in self.vid_idx.keys():
+            # [增加保护] 防止空视频导致 crash
+            if not self.gts[vid]:
+                print(f"Warning: Video {vid} has no GT data!")
+                continue
+                
             t_min = min(self.gts[vid].keys())
             t_max = max(self.gts[vid].keys())
             self.sample_vid_tmax[vid] = t_max
@@ -111,10 +146,24 @@ class DanceTrack(MOTDataset):
         return
 
     def get_single_frame(self, vid: str, idx: int):
-        img_path = os.path.join(
-            self.split_dir,
-            vid, "img1",
-            f"{idx:08d}.jpg" if self.dataset_name == "DanceTrack" else f"{idx:06d}.jpg")
+        # 优先尝试 8位 格式
+        img_path_8 = os.path.join(self.split_dir, vid, "img1", f"{idx:08d}.jpg")
+        # 其次尝试 6位 格式
+        img_path_6 = os.path.join(self.split_dir, vid, "img1", f"{idx:06d}.jpg")
+        # 最后尝试 无补零 格式
+        img_path_raw = os.path.join(self.split_dir, vid, "img1", f"{idx}.jpg")
+        
+        if os.path.exists(img_path_8):
+            img_path = img_path_8
+        elif os.path.exists(img_path_6):
+            img_path = img_path_6
+        elif os.path.exists(img_path_raw):
+            img_path = img_path_raw
+        else:
+            # 默认回退，或者报错提示
+            img_path = img_path_8 
+            # print(f"Warning: Image not found {img_path}")
+
         img = Image.open(img_path)
         info = {}
         ids_offset = self.vid_idx[vid] * 100000
@@ -145,7 +194,8 @@ class DanceTrack(MOTDataset):
 
         return img, info
 
-    def get_multi_frames(self, vid: str, idxs: list[int]):
+    # [修复] 这里 list[int] 改为了 List[int]
+    def get_multi_frames(self, vid: str, idxs: List[int]):
         return zip(*[self.get_single_frame(vid=vid, idx=i) for i in idxs])
 
 

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# [修复] 确保导入 List
 from typing import List
 
 from .mlp import MLP
@@ -17,6 +18,11 @@ from .utils import get_clones, pos_to_pos_embed
 
 from .backbone import build as build_backbone_with_pe
 from .deformable_transformer import build as build_deformable_transformer
+
+# [新增] 导入你的创新模块
+# 确保你的 adapter.py 和 bi_mamba.py 已经在 models/ 目录下
+from .adapter import SceneAwareAdapter
+from .temporal_mamba import TemporalAwareMamba
 
 from utils.nested_tensor import NestedTensor
 from structures.track_instances import TrackInstances
@@ -53,6 +59,23 @@ class MeMOTR(nn.Module):
         self.backbone = backbone
         self.transformer = transformer
         self.query_updater = query_updater
+        
+        # =====================================================================
+        # [创新点 1] 初始化 Scene Adapter
+        # 放置在 Feature Projection 之后，所以输入通道是 hidden_dim (256)
+        # =====================================================================
+        self.scene_adapter = SceneAwareAdapter(in_channels=hidden_dim, num_scenes=3)
+
+        # =====================================================================
+        # [创新点 2] 初始化Mamba
+        # 用于增强 Transformer 输出的 Query 特征
+        # =====================================================================
+        self.temporal_mamba = TemporalAwareMamba(
+            d_model=hidden_dim, 
+            d_state=32, 
+            n_det_queries=self.n_det_queries
+        )
+
         self.class_embed = nn.Linear(in_features=self.hidden_dim, out_features=num_classes)
         self.bbox_embed = MLP(input_dim=self.hidden_dim, hidden_dim=self.hidden_dim, output_dim=4, num_layers=3)
         if self.use_dab:
@@ -94,7 +117,8 @@ class MeMOTR(nn.Module):
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(self.transformer.get_n_dec_layers())])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(self.transformer.get_n_dec_layers())])
 
-    def forward(self, frame: NestedTensor, tracks: list[TrackInstances]):
+    # [修复] 将 tracks: list[TrackInstances] 改为 List[TrackInstances] 以兼容旧版Python
+    def forward(self, frame: NestedTensor, tracks: List[TrackInstances]):
         if self.visualize:
             os.makedirs("./outputs/visualize_tmp/memotr/", exist_ok=True)
 
@@ -105,22 +129,51 @@ class MeMOTR(nn.Module):
             features, pos = self.backbone(frame)
 
         srcs, masks = [], []
+        # 用于存储 Scene Adapter 预测的场景分类结果 (用于辅助 Loss)
+        self.current_scene_logits = None
+
         for layer, feat in enumerate(features):
             src, mask = feat.decompose()
-            srcs.append(self.feature_projs[layer](src))
+            # 1. 先投影到 unified hidden_dim (256)
+            src_proj = self.feature_projs[layer](src)
+            
+            # =================================================================
+            # [创新点 1 接入] Scene Adapter
+            # 对特征进行“自适应清洗”，去除水下浑浊/光照影响
+            # =================================================================
+            src_adapted, scene_logits = self.scene_adapter(src_proj)
+            
+            # 如果是最后一层特征，记录下 Logits (假设场景主要由深层语义决定)
+            if layer == len(features) - 1:
+                self.current_scene_logits = scene_logits
+
+            # 将清洗后的特征送入列表
+            srcs.append(src_adapted)
             masks.append(mask)
+
         if self.n_feature_levels > len(srcs):
             srcs_len = len(srcs)
             for layer in range(srcs_len, self.n_feature_levels):
                 if layer == srcs_len:
-                    src = self.feature_projs[layer](features[-1].tensors)
+                    # 注意：这里需要先把 features[-1] 投影，再通过 Adapter
+                    src_raw = features[-1].tensors
+                    src_proj = self.feature_projs[layer](src_raw)
                 else:
-                    src = self.feature_projs[layer](srcs[-1])
+                    # 对于更高层的 FPN，输入是上一层的 src (已经是 adapted 过的了)
+                    # 为了简单，我们对 FPN 生成的层再过一次 Adapter，或者复用上一层的适配策略
+                    # 这里选择：Projection -> Adapter
+                    src_prev = srcs[-1]
+                    src_proj = self.feature_projs[layer](src_prev)
+
+                # [创新点 1 接入] 即使是 FPN 生成的层，也过一遍 Adapter 增强
+                src_adapted, _ = self.scene_adapter(src_proj)
+
                 mask = frame.masks
-                mask = F.interpolate(mask[None, ...].float(), size=src.shape[-2:])[0].to(torch.bool)
-                pos.append(self.backbone.position_embedding(NestedTensor(src, mask)).to(src.device))
-                srcs.append(src)
+                mask = F.interpolate(mask[None, ...].float(), size=src_adapted.shape[-2:])[0].to(torch.bool)
+                pos.append(self.backbone.position_embedding(NestedTensor(src_adapted, mask)).to(src_adapted.device))
+                srcs.append(src_adapted)
                 masks.append(mask)
+        
         # srcs is n_feature_levels * [(B, C, H, W)]
         # masks is n_feature_levels * [(B, H, W)]
         # pos is n_features_levels * [(B, C, H, W)]
@@ -139,6 +192,25 @@ class MeMOTR(nn.Module):
             query_mask=query_mask
         )
         # outputs: (n_dec_layers, B, Nd+Nq, C)
+        
+        # ==================== 【修正后的代码】 ====================
+        # 1. 取出最后一层的输出
+        final_output = outputs[-1]  # [B, N, C]
+        
+        # 2. Mamba 增强
+        enhanced_output = self.temporal_mamba(final_output)
+        
+        # 3. 【关键修复】使用 torch.cat 创建一个新的 Tensor，而不是修改旧的
+        # outputs 的形状是 [Layers, B, N, C]
+        # 我们把 前面几层 (outputs[:-1]) 和 增强后的最后一层 拼接起来
+        
+        # 先把 enhanced_output 变回 [1, B, N, C] 以便拼接
+        enhanced_output_unsqueezed = enhanced_output.unsqueeze(0)
+        
+        # 拼接：前 n-1 层 + 新的第 n 层
+        outputs = torch.cat([outputs[:-1], enhanced_output_unsqueezed], dim=0)
+        # ========================================================
+
         # init_reference: (B, Nd+Nq, 2)
         # inter_references: (n_dec_layers, B, Nd+Nq, 4)
         output_classes, output_bboxes = [], []
@@ -186,6 +258,11 @@ class MeMOTR(nn.Module):
             "det_query_embed": query_embed[0][:self.n_det_queries],
             "init_ref_pts": inverse_sigmoid(init_reference)
         }
+        
+        # [新增] 将 Scene Adapter 的预测结果放入输出字典 (供 Loss 计算使用)
+        if self.current_scene_logits is not None:
+            res['pred_scene_logits'] = self.current_scene_logits
+
         if self.aux_loss:
             res["aux_outputs"] = self.set_aux_loss(output_classes=output_classes,
                                                    output_bboxes=output_bboxes,
@@ -215,7 +292,7 @@ class MeMOTR(nn.Module):
         else:
             return self.transformer.reference_points(self.det_query_embed[:, :self.hidden_dim])
 
-    def get_track_reference_points(self, tracks: list[TrackInstances]):
+    def get_track_reference_points(self, tracks: List[TrackInstances]):
         """
         Returns: (B, Nq, 2/4)
         """
@@ -229,7 +306,7 @@ class MeMOTR(nn.Module):
             references[i, :len(tracks[i].ref_pts), :] = tracks[i].ref_pts
         return references
 
-    def get_track_query_embed(self, tracks: list[TrackInstances]):
+    def get_track_query_embed(self, tracks: List[TrackInstances]):
         """
         Returns: (B, Nq, 2C)
         """
@@ -242,7 +319,7 @@ class MeMOTR(nn.Module):
             query_embed[i, :len(tracks[i].query_embed), :] = tracks[i].query_embed
         return query_embed
 
-    def get_reference_points(self, tracks: list[TrackInstances]):
+    def get_reference_points(self, tracks: List[TrackInstances]):
         det_references = self.get_det_reference_points().repeat(len(tracks), 1, 1)                      # (B, Nd, 2)
         if det_references.shape[-1] == 2:
             det_references = torch.cat(
@@ -252,7 +329,7 @@ class MeMOTR(nn.Module):
         track_references = self.get_track_reference_points(tracks=tracks).to(det_references.device)     # (B, Nq, 2)
         return torch.cat((det_references, track_references), dim=1)
 
-    def get_query_embed(self, tracks: list[TrackInstances]):
+    def get_query_embed(self, tracks: List[TrackInstances]):
         """
         Returns: (B, Nd+Nq, 2C)
         """
@@ -264,7 +341,7 @@ class MeMOTR(nn.Module):
         track_query_embed = self.get_track_query_embed(tracks).to(det_query_embed.device)       # (B, Nq, 2C)
         return torch.cat((det_query_embed, track_query_embed), dim=1)
 
-    def get_query_mask(self, tracks: list[TrackInstances]):
+    def get_query_mask(self, tracks: List[TrackInstances]):
         """
         Returns: (B, Nd+Nq)
         """

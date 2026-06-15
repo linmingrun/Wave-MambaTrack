@@ -87,7 +87,7 @@ def train(config: dict):
     start_epoch = train_states["start_epoch"]
 
     if is_distributed():
-        model = DDP(module=model, device_ids=[distributed_rank()], find_unused_parameters=False)
+        model = DDP(module=model, device_ids=[distributed_rank()], find_unused_parameters=True)
 
     multi_checkpoint = "MULTI_CHECKPOINT" in config and config["MULTI_CHECKPOINT"]
 
@@ -143,7 +143,7 @@ def train(config: dict):
         if multi_checkpoint is True:
             pass
         else:
-            if config["DATASET"] == "DanceTrack" or config["EPOCHS"] < 100 or (epoch + 1) % 5 == 0:
+            if config["DATASET"] == "DanceTrack" or config["EPOCHS"] < 100 or (epoch + 1) % 20 == 0:
                 save_checkpoint(
                     model=model,
                     path=os.path.join(config["OUTPUTS_DIR"], f"checkpoint_{epoch}.pth"),

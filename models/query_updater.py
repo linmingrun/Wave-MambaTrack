@@ -14,6 +14,72 @@ from structures.track_instances import TrackInstances
 from utils.utils import inverse_sigmoid
 from utils.box_ops import box_cxcywh_to_xyxy, box_iou_union
 
+# ====================================================================================
+# [创新点模块] Trajectory-Guided Query Attention (TGQA)
+# 包含轨迹编码器和自适应门控融合机制
+# ====================================================================================
+
+class TrajectoryEncoder(nn.Module):
+    def __init__(self, d_model=256, history_len=5):
+        """
+        将轨迹坐标序列编码成高维特征
+        """
+        super().__init__()
+        self.history_len = history_len
+        input_dim = history_len * 2  # (x, y) * len
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model)
+        )
+
+    def forward(self, track_history):
+        # track_history: [Batch, Num_Tracks, history_len, 2]
+        b, n, l, c = track_history.shape
+        # 展平轨迹: [B, N, L*2]
+        flat_traj = track_history.view(b, n, -1)
+        # 编码
+        return self.mlp(flat_traj)
+
+class TrajectoryGuidedFusion(nn.Module):
+    def __init__(self, d_model=256, history_len=5):
+        super().__init__()
+        self.traj_encoder = TrajectoryEncoder(d_model, history_len)
+        
+        # 自适应门控网络: 决定听视觉的还是听轨迹的
+        self.gate_net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, d_model),
+            nn.Sigmoid() # 输出 0~1 的权重
+        )
+        
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, visual_query, track_history):
+        """
+        visual_query: [B, N, C]
+        track_history: [B, N, L, 2]
+        """
+        # 1. 编码轨迹
+        traj_embed = self.traj_encoder(track_history)
+        
+        # 2. 计算门控系数
+        combined = torch.cat([visual_query, traj_embed], dim=-1)
+        gate = self.gate_net(combined)
+        
+        # 3. 柔性融合 (基线保护机制：如果不准，Gate会自动趋向0)
+        fused_query = visual_query + (gate * traj_embed)
+        
+        # 4. 投影与归一化
+        output = self.norm(self.out_proj(fused_query))
+        return output
+
+# ====================================================================================
 
 class QueryUpdater(nn.Module):
     def __init__(self, hidden_dim: int, ffn_dim: int,
@@ -35,6 +101,10 @@ class QueryUpdater(nn.Module):
 
         self.update_threshold = update_threshold
         self.long_memory_lambda = long_memory_lambda
+
+        # [新增] 初始化轨迹融合模块
+        # history_len 必须与 RuntimeTracker 中设置的一致 (默认为 5)
+        self.traj_fusion = TrajectoryGuidedFusion(d_model=self.hidden_dim, history_len=5)
 
         self.confidence_weight_net = nn.Sequential(
             MLP(input_dim=self.hidden_dim, hidden_dim=self.hidden_dim, output_dim=self.hidden_dim, num_layers=2),
@@ -86,15 +156,12 @@ class QueryUpdater(nn.Module):
             if self.visualize:
                 os.makedirs("./outputs/visualize_tmp/query_updater/", exist_ok=True)
                 torch.save(tracks[b].ref_pts.cpu(), "./outputs/visualize_tmp/query_updater/current_ref_pts.tensor")
-                # torch.save(tracks[b].query_embed[:, :].cpu(),
-                #            "./outputs/visualize_tmp/query_updater/current_query_pos.tensor")
-                # torch.save(tracks[b].query_embed[:, :].cpu(),
-                #            "./outputs/visualize_tmp/query_updater/current_query_feat.tensor")
                 torch.save(tracks[b].query_embed.cpu(),
                            "./outputs/visualize_tmp/query_updater/current_query_feat.tensor")
                 torch.save(tracks[b].ids.cpu(), "./outputs/visualize_tmp/query_updater/current_ids.tensor")
                 torch.save(tracks[b].labels.cpu(), "./outputs/visualize_tmp/query_updater/current_labels.tensor")
-                torch.save(scores.cpu(), "./outputs/visualize_tmp/query_updater/current_scores.tensor")
+                torch.save(tracks[b].scores.cpu(), "./outputs/visualize_tmp/query_updater/current_scores.tensor")
+            
             if self.use_dab:
                 tracks[b].ref_pts[is_pos] = inverse_sigmoid(tracks[b][is_pos].boxes.detach().clone())
             else:
@@ -104,6 +171,22 @@ class QueryUpdater(nn.Module):
             output_embed = tracks[b].output_embed
             last_output_embed = tracks[b].last_output
             long_memory = tracks[b].long_memory.detach()
+
+            # ===========================================================================
+            # [创新点接入] Trajectory-Guided Query Enhancement
+            # ===========================================================================
+            # 检查当前 tracks 是否包含历史轨迹数据 (由 RuntimeTracker 维护)
+            if hasattr(tracks[b], 'ref_pts_history'):
+                # 获取历史轨迹: [Num_Tracks, history_len, 2]
+                history = tracks[b].ref_pts_history
+                
+                # 调整维度以适配 Fusion 模块: [1, N, L, 2] -> 处理 -> [N, C]
+                # 因为 update_tracks_embedding 是按 batch 循环的，这里相当于 batch=1
+                enhanced_embed = self.traj_fusion(output_embed.unsqueeze(0), history.unsqueeze(0))
+                
+                # 更新 output_embed
+                output_embed = enhanced_embed.squeeze(0)
+            # ===========================================================================
 
             # Confidence Weight
             confidence_weight = self.confidence_weight_net(output_embed)
@@ -153,10 +236,6 @@ class QueryUpdater(nn.Module):
 
             if self.visualize:
                 torch.save(tracks[b].ref_pts.cpu(), "./outputs/visualize_tmp/query_updater/next_ref_pts.tensor")
-                # torch.save(tracks[b].query_embed[:, :self.hidden_dim].cpu(),
-                #            "./outputs/visualize_tmp/query_updater/next_query_pos.tensor")
-                # torch.save(tracks[b].query_embed[:, self.hidden_dim:].cpu(),
-                #            "./outputs/visualize_tmp/query_updater/next_query_feat.tensor")
                 torch.save(tracks[b].query_embed.cpu(),
                            "./outputs/visualize_tmp/query_updater/next_query_feat.tensor")
                 torch.save(tracks[b].ids.cpu(), "./outputs/visualize_tmp/query_updater/next_ids.tensor")
@@ -174,15 +253,37 @@ class QueryUpdater(nn.Module):
             for b in range(len(new_tracks)):
                 # Update fields
                 new_tracks[b].last_output = new_tracks[b].output_embed
+                
+                # [新增] 初始化新轨迹的历史记录
+                # 训练时可能会有新轨迹加入，需要初始化它们的 history
+                if not hasattr(new_tracks[b], 'ref_pts_history'):
+                    device = new_tracks[b].output_embed.device
+                    n = len(new_tracks[b])
+                    # 用当前的中心点填充满历史，形状 [N, 5, 2]
+                    current_pts = new_tracks[b].boxes[..., :2]
+                    new_tracks[b].ref_pts_history = current_pts.unsqueeze(1).repeat(1, 5, 1)
+
                 if self.use_dab:
                     new_tracks[b].long_memory = new_tracks[b].query_embed
                 else:
                     new_tracks[b].long_memory = new_tracks[b].query_embed[:, self.hidden_dim:]
                 unmatched_dets[b].last_output = unmatched_dets[b].output_embed
+                
+                # 这里的 unmatched 也需要 history，虽然它可能用不到
+                if not hasattr(unmatched_dets[b], 'ref_pts_history'):
+                    device = unmatched_dets[b].output_embed.device
+                    n = len(unmatched_dets[b])
+                    if n > 0:
+                        current_pts = unmatched_dets[b].boxes[..., :2]
+                        unmatched_dets[b].ref_pts_history = current_pts.unsqueeze(1).repeat(1, 5, 1)
+                    else:
+                        unmatched_dets[b].ref_pts_history = torch.zeros((0, 5, 2), device=device)
+
                 if self.use_dab:
                     unmatched_dets[b].long_memory = unmatched_dets[b].query_embed
                 else:
                     unmatched_dets[b].long_memory = unmatched_dets[b].query_embed[:, self.hidden_dim:]
+                
                 if self.tp_drop_ratio == 0.0 and self.fp_insert_ratio == 0.0:
                     active_tracks = TrackInstances.cat_tracked_instances(previous_tracks[b], new_tracks[b])
                     active_tracks = TrackInstances.cat_tracked_instances(active_tracks, unmatched_dets[b])
@@ -238,13 +339,21 @@ class QueryUpdater(nn.Module):
                     fake_tracks.iou = torch.zeros((1,), dtype=torch.float, device=device)
                     fake_tracks.last_output = torch.randn((1, self.hidden_dim), dtype=torch.float, device=device)
                     fake_tracks.long_memory = torch.randn((1, self.hidden_dim), dtype=torch.float, device=device)
+                    # Fake track 也需要初始化 history
+                    fake_tracks.ref_pts_history = torch.zeros((1, 5, 2), dtype=torch.float, device=device)
                     active_tracks = fake_tracks
                 tracks.append(active_tracks)
         else:
             # Eval only has B=1.
             assert len(previous_tracks) == 1 and len(new_tracks) == 1
             new_tracks[0].last_output = new_tracks[0].output_embed
-            # new_tracks[0].long_memory = new_tracks[0].query_embed
+            
+            # [新增] Eval 模式下初始化新轨迹的历史
+            if not hasattr(new_tracks[0], 'ref_pts_history'):
+                device = new_tracks[0].output_embed.device
+                current_pts = new_tracks[0].boxes[..., :2]
+                new_tracks[0].ref_pts_history = current_pts.unsqueeze(1).repeat(1, 5, 1)
+
             if self.use_dab:
                 new_tracks[0].long_memory = new_tracks[0].query_embed
             else:
@@ -268,4 +377,3 @@ def build(config: dict):
             long_memory_lambda=config["LONG_MEMORY_LAMBDA"],
             visualize=config["VISUALIZE"]
         )
-

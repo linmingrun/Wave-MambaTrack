@@ -1,5 +1,5 @@
 # @Author       : Ruopeng Gao
-# @Description  : Config for training DanceTrack.
+# @Description  : Config for training MeMOTR (Fixed for Fish Tracking - 60 Epochs)
 
 GIT_VERSION:
 
@@ -8,44 +8,44 @@ CONFIG_PATH:
 VISUALIZE: False
 AVAILABLE_GPUS: 0,1,2,3,4,5,6,7
 DEVICE: cuda
-OUTPUTS_DIR: ./outputs/pycharm/
+OUTPUTS_DIR: ./outputs/memotr_fish_fixed_60ep/
 USE_DISTRIBUTED: False
 USE_CHECKPOINT: False
-CHECKPOINT_LEVEL: 2               # gradient checkpoint level.
-                                  # As the number increases (from 1 to 4), the memory cost increases.
-                                  # We have deleted many comments in this official code simplicity,
-                                  # if you have any questions, feel free to contact with the author.
-RESUME:
-RESUME_SCHEDULER: True
+CHECKPOINT_LEVEL: 2
+RESUME:                                      # [关键] 留空
+RESUME_SCHEDULER: False                      # [关键] False
 MULTI_CHECKPOINT: False
 
+# =================================================
+# 核心修改：数据集只有 test
+# =================================================
 # About submit
 SUBMIT_DIR:
 SUBMIT_MODEL:
-SUBMIT_DATA_SPLIT: test
+SUBMIT_DATA_SPLIT: test                      # [修改] 改为 test (原本是 val)
 DET_SCORE_THRESH: 0.5
-TRACK_SCORE_THRESH: 0.5
+TRACK_SCORE_THRESH: 0.4                      # [修改] 稍微降低门槛
 RESULT_SCORE_THRESH: 0.5
-MISS_TOLERANCE: 15
-USE_MOTION: False
+MISS_TOLERANCE: 30                           # [修改] 允许跟丢更久
+USE_MOTION: True                             # [关键] 必须开启
 MOTION_MIN_LENGTH: 3
 MOTION_MAX_LENGTH: 5
-MOTION_LAMBDA: 0.5
+MOTION_LAMBDA: 1.2                           # [关键] 提高运动权重
 
 # About Evaluation
 EVAL_DIR:
-EVAL_MODE: specific               # specific/continue
+EVAL_MODE: specific
 EVAL_MODEL:
 EVAL_PORT:
 EVAL_THREADS: 1
-EVAL_DATA_SPLIT: val
+EVAL_DATA_SPLIT: test                        # [修改] 改为 test (原本是 val)
 
 # About data processing
 DATASET: MOT17
-USE_MOTSYNTH:
-USE_CROWDHUMAN: True
+USE_MOTSYNTH: False
+USE_CROWDHUMAN: False
 MOTSYNTH_RATE:
-DATA_ROOT:
+DATA_ROOT:                                   # 运行时命令行指定
 DATA_PATH:
 NUM_WORKERS: 4
 BATCH_SIZE: 1
@@ -72,11 +72,13 @@ AUX_LOSS: True
 USE_DAB: True
 UPDATE_THRESH: 0.5
 LONG_MEMORY_LAMBDA: 0.01
+
 # Pretrain model
-PRETRAINED_MODEL: dab_deformable_detr.pth
+# [关键] 这里的路径一定要对
+PRETRAINED_MODEL: '/home/LiaoYangHao/LinMingRun/MeMOTR/output/memotr_dancetrack/checkpoint_119.pth'
 
 # Sampling setting
-SAMPLE_STEPS: [60, 100]
+SAMPLE_STEPS: [30, 50]
 SAMPLE_LENGTHS: [2, 3, 4]
 SAMPLE_MODES: [random_interval]
 SAMPLE_INTERVALS: [10]
@@ -84,28 +86,28 @@ SAMPLE_MOT17_JOIN: 0
 
 # Training setting
 SEED: 42
-EPOCHS: 130
-ONLY_TRAIN_QUERY_UPDATER_AFTER: 130
-DROPOUT: 0.0
+EPOCHS: 60
+ONLY_TRAIN_QUERY_UPDATER_AFTER: 25
+DROPOUT: 0.1                                 # [关键] 防止过拟合
 NUM_DET_QUERIES: 300
-# training augmentation
 TP_DROP_RATE: 0.0
 FP_INSERT_RATE: 0.0
 LR: 2.0e-4
 LR_BACKBONE: 2.0e-5
 LR_POINTS: 2.0e-5
-WEIGHT_DECAY: 0.0001
+WEIGHT_DECAY: 0.0002
 CLIP_MAX_NORM: 0.1
 LR_SCHEDULER: MultiStep
 LR_DROP_RATE: 0.1
-LR_DROP_MILESTONES: [120]
+LR_DROP_MILESTONES: [40, 50]
+
 # DETR matcher
 MATCH_COST_CLASS: 2
-MATCH_COST_BBOX: 5
-MATCH_COST_GIOU: 2
+MATCH_COST_BBOX: 10                          # [关键] 信任位置
+MATCH_COST_GIOU: 5                           # [关键] 信任重叠度
+
 # DETR loss
 LOSS_WEIGHT_FOCAL: 2
 LOSS_WEIGHT_L1: 5
 LOSS_WEIGHT_GIOU: 2
-# Aux Loss Weight
 AUX_LOSS_WEIGHT: [1.0, 1.0, 1.0, 1.0, 1.0]

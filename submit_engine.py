@@ -208,7 +208,7 @@ def submit(config: dict):
     motion_max_length = config["MOTION_MAX_LENGTH"]
     motion_lambda = config["MOTION_LAMBDA"]
     miss_tolerance = config["MISS_TOLERANCE"]
-
+    train_config["BACKBONE"] = config["BACKBONE"]  # ← 加这一句
     model = build_model(config=train_config)
     load_checkpoint(
         model=model,

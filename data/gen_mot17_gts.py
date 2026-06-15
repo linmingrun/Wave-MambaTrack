@@ -13,8 +13,8 @@ def mkdirs(d):
 
 
 # You should change the path to your own path:
-seq_root = "/data0/DatasetsForMeMOTR/MOT17/images/train"
-label_root = "/data0/DatasetsForMeMOTR/MOT17/gts/train"
+seq_root = "/home/LiaoYangHao/LinMingRun/MeMOTR/MOT17/images/test"
+label_root = "/home/LiaoYangHao/LinMingRun/MeMOTR/MOT17/gts/test"
 mkdirs(label_root)
 seqs = [s for s in os.listdir(seq_root)]
 

@@ -1,0 +1,4 @@
+# ninja log v7
+0	13386	1767334627876929520	/home/LiaoYangHao/LinMingRun/MeMOTR/models/ops/build/temp.linux-x86_64-cpython-312/home/LiaoYangHao/LinMingRun/MeMOTR/models/ops/src/cpu/ms_deform_attn_cpu.o	3d6346bade3526a1
+1	28871	1767334627880929882	/home/LiaoYangHao/LinMingRun/MeMOTR/models/ops/build/temp.linux-x86_64-cpython-312/home/LiaoYangHao/LinMingRun/MeMOTR/models/ops/src/vision.o	18b07ad446ef1f44
+1	35472	1767334627880929882	/home/LiaoYangHao/LinMingRun/MeMOTR/models/ops/build/temp.linux-x86_64-cpython-312/home/LiaoYangHao/LinMingRun/MeMOTR/models/ops/src/cuda/ms_deform_attn_cuda.o	fe4377cf4cfd6a96

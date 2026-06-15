@@ -1,17 +1,6 @@
 # Copyright (c) Ruopeng Gao. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from MOTR (https://github.com/megvii-research/MOTR)
-# Copyright (c) 2021 megvii-model. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
-# Copyright (c) 2020 SenseTime. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from DETR (https://github.com/facebookresearch/detr)
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-# ------------------------------------------------------------------------
 import torch
 import copy
-
 import torch.nn.functional as F
 import torch.distributed
 
@@ -22,21 +11,29 @@ from structures.track_instances import TrackInstances
 from utils.box_ops import generalized_box_iou, box_cxcywh_to_xyxy, box_iou_union
 from utils.utils import is_distributed, distributed_world_size
 
+# ====================================================================================
+# [创新点] Bio-Motion Loss: 生物运动一致性损失
+# ====================================================================================
+def biological_motion_loss(pred_boxes, prev_pred_boxes, gt_boxes, prev_gt_boxes):
+    if len(pred_boxes) == 0:
+        return torch.tensor(0.0, device=pred_boxes.device)
+
+    # 1. 计算速度向量
+    pred_vel = pred_boxes[:, :2] - prev_pred_boxes[:, :2]
+    gt_vel = gt_boxes[:, :2] - prev_gt_boxes[:, :2]
+    
+    # 2. 计算 Loss (Reduction 改为 sum)
+    # beta=0.1 对于归一化坐标是可以的，如果想更激进可以用 beta=0.01
+    loss_motion = F.smooth_l1_loss(pred_vel, gt_vel, beta=0.1, reduction='sum')
+    
+    return loss_motion
+# ====================================================================================
+
 
 class ClipCriterion:
     def __init__(self, num_classes, matcher: HungarianMatcher, n_det_queries, aux_loss: bool, weight: dict,
                  max_frame_length: int, n_aux: int, merge_det_track_layer: int = 0, aux_weights: List = None,
                  hidden_dim: int = 256, use_dab: bool = True):
-        """
-        Init a criterion function.
-
-        Args:
-            num_classes: class num.
-            matcher: matcher from DETR.
-            n_det_queries: how many detection queries.
-            aux_loss: whether use aux loss.
-            weight: include "box_l1_loss", "box_giou_loss", "label_focal_loss"
-        """
         self.device: None | torch.device = None
         self.aux_loss = aux_loss
         self.weight = weight
@@ -46,29 +43,24 @@ class ClipCriterion:
         self.max_frame_length = max_frame_length
         self.n_aux = n_aux
         self.use_dab = use_dab
-        self.frame_weights = [1.0] * self.max_frame_length  # if you want to set different weights for different frames
-        self.aux_weights = aux_weights                      # different weights for different DETR layers
+        self.frame_weights = [1.0] * self.max_frame_length
+        self.aux_weights = aux_weights
         self.hidden_dim = hidden_dim
         self.merge_det_track_layer = merge_det_track_layer
 
-        self.gt_trackinstances_list: None | List[List[TrackInstances]] = None     # (clip_size, B)
+        self.gt_trackinstances_list: None | List[List[TrackInstances]] = None
         self.loss = {}
         self.log = {}
         self.n_gts = []
+        
+        # [新增] 用于存储上一帧的匹配结果，以便计算 Motion Loss
+        # 格式: {track_id: (pred_box, gt_box)}
+        self.prev_frame_pairs = {} 
 
     def set_device(self, device: torch.device):
         self.device = device
 
     def init_a_clip(self, batch: Dict, hidden_dim: int, num_classes: int, device: torch.device):
-        """
-        Init this function for a specific clip.
-        Args:
-            batch: a batch data.
-            hidden_dim:
-            num_classes:
-            device:
-        Returns:
-        """
         self.device = device
         clip_size = len(batch["imgs"][0])
         batch_size = len(batch["imgs"])
@@ -84,21 +76,25 @@ class ClipCriterion:
             self.gt_trackinstances_list.append(gt_trackinstances)
 
         self.n_gts = []
+        # 初始化上一帧记录
+        self.prev_frame_pairs = {} # Clear history for new clip
+
+        # 初始化 Loss 字典，加入 bio_motion_loss
+        base_losses = {
+            "box_l1_loss": torch.zeros(()).to(self.device),
+            "box_giou_loss": torch.zeros(()).to(self.device),
+            "label_focal_loss": torch.zeros(()).to(self.device),
+            "bio_motion_loss": torch.zeros(()).to(self.device), # [新增]
+        }
         if self.aux_loss:
-            self.loss = {
-                "box_l1_loss": torch.zeros(()).to(self.device),
-                "box_giou_loss": torch.zeros(()).to(self.device),
-                "label_focal_loss": torch.zeros(()).to(self.device),
+            aux_losses = {
                 "aux_box_l1_loss": torch.zeros(()).to(self.device),
                 "aux_box_giou_loss": torch.zeros(()).to(self.device),
                 "aux_label_focal_loss": torch.zeros(()).to(self.device)
             }
-        else:
-            self.loss = {
-                "box_l1_loss": torch.zeros(()).to(self.device),
-                "box_giou_loss": torch.zeros(()).to(self.device),
-                "label_focal_loss": torch.zeros(()).to(self.device)
-            }
+            base_losses.update(aux_losses)
+        
+        self.loss = base_losses
         return
 
     def get_sum_loss_dict(self, loss_dict: dict):
@@ -109,6 +105,10 @@ class ClipCriterion:
                 return self.weight["box_giou_loss"]
             elif "label_focal_loss" in loss_name:
                 return self.weight["label_focal_loss"]
+            elif "bio_motion_loss" in loss_name:
+                # [新增] 如果 config 里没配，给一个默认权重 1.0
+                return self.weight.get("bio_motion_loss", 1.0)
+            return 0.0
 
         loss = sum([
             get_weight(k) * v for k, v in loss_dict.items()
@@ -136,38 +136,21 @@ class ClipCriterion:
         return loss, log
 
     def process_single_frame(self, model_outputs: dict, tracked_instances: List[TrackInstances], frame_idx: int):
-        """
-        Process this criterion for a single frame.
-
-        I know this part is really complex and hard to understand (T.T),
-        I will modify these in a possible extension version of this work in the future,
-        but it works, doesn't it? :)
-        Args:
-            model_outputs: outputs from DETR.
-            tracked_instances: already tracked instances.
-            frame_idx: frame_idx t.
-        """
-        # 1. Get the GTs in current t frame.
         gt_trackinstances = self.gt_trackinstances_list[frame_idx]
-
-        # 2. Update the already tracked instances.
         tracked_instances = self.update_tracked_instances(model_outputs=model_outputs,
                                                           tracked_instances=tracked_instances)
 
-        # 3. Get the detection results in current frame.
         detection_res = {
-            "pred_logits": model_outputs["pred_logits"][:, :self.n_det_queries, :].detach(),    # (B, Nd, n_classes)
-            "pred_boxes": model_outputs["pred_bboxes"][:, :self.n_det_queries, :].detach()      # (B, Nd, 4)
+            "pred_logits": model_outputs["pred_logits"][:, :self.n_det_queries, :].detach(),
+            "pred_boxes": model_outputs["pred_bboxes"][:, :self.n_det_queries, :].detach()
         }
 
-        # 4. Find some gts that do not include in the tracked instances mentioned in (2.),
-        #    this gts need to be detected in current frame.
         gt_ids_to_idx = []
         for b in range(len(tracked_instances)):
             gt_ids_to_idx.append({
                 gt_id.item(): gt_idx for gt_idx, gt_id in enumerate(gt_trackinstances[b].ids)
             })
-        num_disappeared_tracked_gts = 0
+        
         for b in range(len(tracked_instances)):
             gt_idx = []
             if len(tracked_instances[b]) > 0:
@@ -176,10 +159,9 @@ class ClipCriterion:
                         gt_idx.append(gt_ids_to_idx[b][gt_id])
                     else:
                         gt_idx.append(-1)
-                        num_disappeared_tracked_gts += 1
             tracked_instances[b].matched_idx = torch.as_tensor(data=gt_idx,
                                                                dtype=tracked_instances[b].matched_idx.dtype)
-        # 4.+ Filter the gts that not in the tracked instances:
+        
         gt_full_idx = []
         untracked_gt_trackinstances = []
         for b in range(len(tracked_instances)):
@@ -193,7 +175,6 @@ class ClipCriterion:
                     idx_bool[i.item()] = False
             untracked_gt_trackinstances.append(gt_trackinstances[b][idx_bool])
 
-        # 5. Use Hungarian algorithm to matching.
         matcher_res = self.matcher(outputs=detection_res, targets=untracked_gt_trackinstances, use_focal=True)
         matcher_res = [list(mr) for mr in matcher_res]
 
@@ -201,13 +182,12 @@ class ClipCriterion:
             for bi in range(len(res)):
                 ids = untracked_gt_trackinstances[bi].ids[res[bi][1]]
                 idx = []
-                for _ in ids:   # 遍历 ID
+                for _ in ids:
                     idx.append(gt_ids_to_idx[bi][_.item()])
                 res[bi][1] = torch.as_tensor(idx, dtype=torch.long)
             return res
 
-        # 6. Use the matched results to generate the tracked instances.
-        new_trackinstances = []     # len is B
+        new_trackinstances = []
         for b in range(len(tracked_instances)):
             trackinstances = TrackInstances(frame_height=tracked_instances[b].frame_height,
                                             frame_width=tracked_instances[b].frame_width,
@@ -218,7 +198,6 @@ class ClipCriterion:
             gt_idx = torch.as_tensor([gt_ids_to_idx[b][gt_id.item()] for gt_id in gt_ids], dtype=torch.long)
             trackinstances.ids = gt_ids
             trackinstances.matched_idx = gt_idx
-            # trackinstances.query_embed = model_outputs["aux_outputs"][-1]["queries"][b][output_idx]
             if self.use_dab:
                 trackinstances.query_embed = model_outputs["aux_outputs"][-1]["queries"][b][output_idx]
             else:
@@ -237,7 +216,6 @@ class ClipCriterion:
             trackinstances = trackinstances.to(self.device)
             new_trackinstances.append(trackinstances)
 
-        # 7. Add tracked instances to the matcher res, for loss computing.
         matcher_res = matcher_res_for_gt_idx(matcher_res)
         tracked_idx_to_gts_idx = []
         for b in range(len(tracked_instances)):
@@ -253,36 +231,113 @@ class ClipCriterion:
             outputs_idx_to_gts_idx[b][0] = torch.cat((outputs_idx_to_gts_idx[b][0], tracked_idx_to_gts_idx[b][0]))
             outputs_idx_to_gts_idx[b][1] = torch.cat((outputs_idx_to_gts_idx[b][1], tracked_idx_to_gts_idx[b][1]))
 
-        # 8. Compute the classification loss.
+        # 8. Compute Classification Loss
         loss_label = self.get_loss_label(outputs=model_outputs,
                                          gt_trackinstances=gt_trackinstances,
                                          idx_to_gts_idx=outputs_idx_to_gts_idx)
 
-        # 9. Compute the bounding box loss.
+        # 9. Compute Box Loss
         loss_l1, loss_giou = self.get_loss_box(outputs=model_outputs,
                                                gt_trackinstances=gt_trackinstances,
                                                idx_to_gts_idx=outputs_idx_to_gts_idx)
 
-        # 10. Count how many GTs.
+        # =========================================================================
+        # 9.5 [创新点] Compute Bio-Motion Loss
+        # =========================================================================
+        loss_bio = torch.tensor(0.0).to(self.device)
+        
+        # 只在第二帧开始计算 (frame_idx > 0)，因为需要上一帧的数据
+        if frame_idx > 0 and len(self.prev_frame_pairs) > 0:
+            for b in range(len(gt_trackinstances)):
+                # 找到当前帧匹配成功的 ID
+                # outputs_idx_to_gts_idx[b][0] 是预测框索引，[1] 是 GT 索引
+                pred_indices = outputs_idx_to_gts_idx[b][0]
+                gt_indices = outputs_idx_to_gts_idx[b][1]
+                
+                # 筛选出匹配有效的 (gt_idx >= 0)
+                valid_mask = gt_indices >= 0
+                valid_pred_idx = pred_indices[valid_mask]
+                valid_gt_idx = gt_indices[valid_mask]
+                
+                if len(valid_pred_idx) == 0:
+                    continue
+
+                # 取出当前帧的 boxes
+                curr_pred_boxes = model_outputs["pred_bboxes"][b][valid_pred_idx]
+                curr_gt_boxes = gt_trackinstances[b].boxes[valid_gt_idx]
+                
+                # 取出这些 ID 对应的上一帧 boxes
+                # 需要通过 ID 来查找
+                valid_ids = gt_trackinstances[b].ids[valid_gt_idx].tolist()
+                
+                prev_pred_list = []
+                prev_gt_list = []
+                curr_pred_matched = [] # 只计算那些在上一帧也出现过的 ID
+                curr_gt_matched = []
+                
+                if b in self.prev_frame_pairs:
+                    prev_data = self.prev_frame_pairs[b] # dict: {id: (pred_box, gt_box)}
+                    
+                    for i, tid in enumerate(valid_ids):
+                        if tid in prev_data:
+                            # 找到了这个 ID 上一帧的数据
+                            prev_pred, prev_gt = prev_data[tid]
+                            prev_pred_list.append(prev_pred)
+                            prev_gt_list.append(prev_gt)
+                            curr_pred_matched.append(curr_pred_boxes[i])
+                            curr_gt_matched.append(curr_gt_boxes[i])
+                
+                if len(prev_pred_list) > 0:
+                    t_prev_pred = torch.stack(prev_pred_list)
+                    t_prev_gt = torch.stack(prev_gt_list)
+                    t_curr_pred = torch.stack(curr_pred_matched)
+                    t_curr_gt = torch.stack(curr_gt_matched)
+                    
+                    # 计算 Loss
+                    loss_bio += biological_motion_loss(t_curr_pred, t_prev_pred, t_curr_gt, t_prev_gt)
+
+        # 记录当前帧数据，供下一帧使用
+        # self.prev_frame_pairs[b] = {id: (pred, gt)}
+        new_prev_pairs = {}
+        for b in range(len(gt_trackinstances)):
+            batch_pairs = {}
+            pred_indices = outputs_idx_to_gts_idx[b][0]
+            gt_indices = outputs_idx_to_gts_idx[b][1]
+            valid_mask = gt_indices >= 0
+            valid_pred_idx = pred_indices[valid_mask]
+            valid_gt_idx = gt_indices[valid_mask]
+            
+            if len(valid_pred_idx) > 0:
+                curr_preds = model_outputs["pred_bboxes"][b][valid_pred_idx].detach() # Detach! 不传梯度到上一帧
+                curr_gts = gt_trackinstances[b].boxes[valid_gt_idx]
+                curr_ids = gt_trackinstances[b].ids[valid_gt_idx]
+                
+                for i, tid in enumerate(curr_ids):
+                    batch_pairs[tid.item()] = (curr_preds[i], curr_gts[i])
+            new_prev_pairs[b] = batch_pairs
+        self.prev_frame_pairs = new_prev_pairs
+        # =========================================================================
+
         n_gts = sum([len(gts) for gts in gt_trackinstances])
         self.loss["box_l1_loss"] += loss_l1 * self.frame_weights[frame_idx]
         self.loss["box_giou_loss"] += loss_giou * self.frame_weights[frame_idx]
         self.loss["label_focal_loss"] += loss_label * self.frame_weights[frame_idx]
-        # Update logs.
+        
+        # 加上 Bio Loss
+        self.loss["bio_motion_loss"] += loss_bio * self.frame_weights[frame_idx]
+
         self.log[f"frame{frame_idx}_box_l1_loss"] = loss_l1.item()
         self.log[f"frame{frame_idx}_box_giou_loss"] = loss_giou.item()
         self.log[f"frame{frame_idx}_label_focal_loss"] = loss_label.item()
+        self.log[f"frame{frame_idx}_bio_motion_loss"] = loss_bio.item() # Log it
         self.n_gts.append(n_gts)
 
-        # 11. Compute aux loss.
         if self.aux_loss:
             for i, aux_outputs in enumerate(model_outputs["aux_outputs"]):
-                # Same to 3.
                 aux_det_res = {
                     "pred_logits": aux_outputs["pred_logits"][:, :self.n_det_queries, :].detach(),
                     "pred_boxes": aux_outputs["pred_bboxes"][:, :self.n_det_queries, :].detach()
                 }
-                # Same to 5.
                 if i < self.merge_det_track_layer:
                     aux_matcher_res = self.matcher(outputs=aux_det_res, targets=gt_trackinstances,
                                                    use_focal=True)
@@ -292,7 +347,6 @@ class ClipCriterion:
                                                    use_focal=True)
                     aux_matcher_res = [list(mr) for mr in aux_matcher_res]
                     aux_matcher_res = matcher_res_for_gt_idx(aux_matcher_res)
-                # Same to some part in 7.
                 aux_idx_to_gts_idx = copy.deepcopy(aux_matcher_res)
                 for b in range(len(tracked_instances)):
                     if i < self.merge_det_track_layer:
@@ -302,7 +356,6 @@ class ClipCriterion:
                         aux_idx_to_gts_idx[b][0] = torch.cat((aux_idx_to_gts_idx[b][0], tracked_idx_to_gts_idx[b][0]))
                         aux_idx_to_gts_idx[b][1] = torch.cat((aux_idx_to_gts_idx[b][1], tracked_idx_to_gts_idx[b][1]))
 
-                # Compute the aux loss.
                 aux_loss_label = self.get_loss_label(outputs=model_outputs["aux_outputs"][i],
                                                      gt_trackinstances=gt_trackinstances,
                                                      idx_to_gts_idx=aux_idx_to_gts_idx)
@@ -314,7 +367,6 @@ class ClipCriterion:
                 self.loss["aux_box_giou_loss"] += aux_loss_giou * self.frame_weights[frame_idx] * self.aux_weights[i]
                 self.loss["aux_label_focal_loss"] += aux_loss_label * self.frame_weights[frame_idx] * self.aux_weights[i]
 
-        # Prepare the unmatched detection results.
         unmatched_detections = []
         for b in range(len(tracked_instances)):
             matched_indexes = set(outputs_idx_to_gts_idx[b][0].tolist())
@@ -329,7 +381,6 @@ class ClipCriterion:
             detections.output_embed = model_outputs["outputs"][b][unmatched_indexes]
             detections.logits = model_outputs["pred_logits"][b][unmatched_indexes]
             detections.boxes = model_outputs["pred_bboxes"][b][unmatched_indexes]
-            # detections.query_embed = model_outputs["aux_outputs"][-1]["queries"][b][unmatched_indexes]
             if self.use_dab:
                 detections.query_embed = model_outputs["aux_outputs"][-1]["queries"][b][unmatched_indexes]
             else:
@@ -346,12 +397,10 @@ class ClipCriterion:
             unmatched_detections.append(detections)
             pass
 
-        # Move to device.
         for b in range(len(tracked_instances)):
             tracked_instances[b] = tracked_instances[b].to(self.device)
             new_trackinstances[b] = new_trackinstances[b].to(self.device)
 
-        # Compute IoU.
         for b in range(len(tracked_instances)):
             new_trackinstances[b].iou[new_trackinstances[b].matched_idx >= 0] = torch.diag(box_iou_union(
                 box_cxcywh_to_xyxy(new_trackinstances[b][new_trackinstances[b].matched_idx >= 0].boxes),
@@ -371,24 +420,17 @@ class ClipCriterion:
 
     def update_tracked_instances(self, model_outputs: dict, tracked_instances: List[TrackInstances])\
             -> List[TrackInstances]:
-        """
-        Update tracked instances.
-        """
         for b in range(len(tracked_instances)):
             if len(tracked_instances[b]) > 0:
                 track_mask = model_outputs["query_mask"][b][self.n_det_queries:]
                 tracked_instances[b].boxes = model_outputs["pred_bboxes"][b][self.n_det_queries:][~track_mask]
                 tracked_instances[b].logits = model_outputs["pred_logits"][b][self.n_det_queries:][~track_mask]
-                # Query embed and ref_pts will be updated in the query_updater module.
                 tracked_instances[b].output_embed = model_outputs["outputs"][b][self.n_det_queries:][~track_mask]
                 tracked_instances[b].matched_idx = torch.zeros((0, ), dtype=tracked_instances[b].matched_idx.dtype)
                 tracked_instances[b].labels = torch.zeros((0, ), dtype=tracked_instances[b].matched_idx.dtype)
         return tracked_instances
 
     def get_loss_label(self, outputs, gt_trackinstances: List[TrackInstances], idx_to_gts_idx):
-        """
-        Compute the classification loss.
-        """
         pred_logits = [
             preds[~mask] for preds, mask in zip(outputs["pred_logits"], outputs["query_mask"])
         ]
@@ -415,9 +457,6 @@ class ClipCriterion:
 
     @staticmethod
     def get_loss_box(outputs, gt_trackinstances: List[TrackInstances], idx_to_gts_idx):
-        """
-        Computer the bounding box loss, l1 and giou.
-        """
         matched_pred_boxes = [
             boxes[outputs_idx[0][outputs_idx[1] >= 0]]
             for boxes, outputs_idx in zip(outputs["pred_bboxes"], idx_to_gts_idx)
@@ -440,21 +479,6 @@ class ClipCriterion:
 
 
 def sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2):
-    """
-    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-        alpha: (optional) Weighting factor in range (0,1) to balance
-                positive vs negative examples. Default = -1 (no weighting).
-        gamma: Exponent of the modulating factor (1 - p_t) to
-               balance easy vs hard examples.
-    Returns:
-        Loss tensor
-    """
     prob = inputs.sigmoid()
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = prob * targets + (1 - prob) * (1 - targets)
@@ -464,7 +488,7 @@ def sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2):
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
 
-    return loss.mean(1).sum()   # 在类别上计算平均
+    return loss.mean(1).sum()
 
 
 def build(config: dict):
@@ -483,7 +507,8 @@ def build(config: dict):
         weight={
             "box_l1_loss": config["LOSS_WEIGHT_L1"],
             "box_giou_loss": config["LOSS_WEIGHT_GIOU"],
-            "label_focal_loss": config["LOSS_WEIGHT_FOCAL"]
+            "label_focal_loss": config["LOSS_WEIGHT_FOCAL"],
+            "bio_motion_loss": 1.0  # [建议] 在 config.yaml 里加 LOSS_WEIGHT_BIO: 1.0，或者这里写死
         },
         max_frame_length=max(config["SAMPLE_LENGTHS"]),
         n_aux=config["NUM_DEC_LAYERS"]-1,

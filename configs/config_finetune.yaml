@@ -1,0 +1,158 @@
+# ==============================================================================
+# @Config Name  : config_udmft_finetune.yaml
+# @Description  : UD-MFT Fine-tuning Config (Based on Scheme A Best Model)
+# @Strategy     : Low Learning Rate + Short Epochs -> For Adaptation & SOTA
+# ==============================================================================
+
+GIT_VERSION: "udmft_finetune_v1"
+
+# =================================================
+# 1. 基础运行环境
+# =================================================
+MODE: train
+CONFIG_PATH:
+
+# [修改] 输出到全新目录，千万别覆盖了你那个 0.89 的宝贝模型目录
+OUTPUTS_DIR: /nfs_B/LiaoYangHao/MeMOTR_outputs/
+
+VISUALIZE: False
+AVAILABLE_GPUS: '0,3'         # 使用两张卡进行微调
+DEVICE: cuda
+
+# [建议] 开启分布式训练以加快微调速度
+USE_DISTRIBUTED: True         
+
+USE_CHECKPOINT: False
+CHECKPOINT_LEVEL: 2
+RESUME:                       # 如果微调意外中断，填入 ./output/memotr_udmft_finetune_run1/checkpoint.pth
+RESUME_SCHEDULER: False
+MULTI_CHECKPOINT: False
+
+# =================================================
+# 2. 提交 / 推理设置
+# =================================================
+SUBMIT_DIR:
+SUBMIT_MODEL:
+SUBMIT_DATA_SPLIT: test
+
+# [策略] UD-MFT 鱼群可能更密集，稍微放宽一点阈值以提高 Recall
+DET_SCORE_THRESH: 0.7         # 保持适中，既不漏检也不误报
+TRACK_SCORE_THRESH: 0.6       # 稍微降低一点，保证轨迹连续性
+RESULT_SCORE_THRESH: 0.4      # 输出阈值
+
+MISS_TOLERANCE: 30            # 允许鱼消失约 1 秒（30帧）
+
+USE_MOTION: True              # 必须开启，Mamba 需要运动信息
+MOTION_MIN_LENGTH: 3
+MOTION_MAX_LENGTH: 5
+MOTION_LAMBDA: 0.3
+
+# =================================================
+# 3. 数据集设置 (核心修改)
+# =================================================
+DATASET: DanceTrack              
+
+USE_MOTSYNTH: False
+USE_CROWDHUMAN: False
+MOTSYNTH_RATE: 0.0
+
+DATA_ROOT: /home/LiaoYangHao/LinMingRun/MeMOTR
+
+DATA_PATH:
+NUM_WORKERS: 4                # 4 workers * 2 GPUs = 8 线程
+BATCH_SIZE: 1                 # 显存够大（如24G以上）可以改 2，不够就维持 1
+ACCUMULATION_STEPS: 1         # 微调时不需要太大 Batch，梯度累积可以关掉或设为 2
+
+COCO_SIZE: False
+OVERFLOW_BBOX: False
+REVERSE_CLIP: 0.0
+
+# =================================================
+# 4. 模型结构 (保持 Scheme A 原样)
+# =================================================
+# 必须和你训练 0.89 模型时的结构完全一致，否则权重加载会报错
+BACKBONE: resnet50
+HIDDEN_DIM: 256
+FFN_DIM: 2048
+
+NUM_FEATURE_LEVELS: 4
+NUM_HEADS: 8
+NUM_ENC_POINTS: 4
+NUM_DEC_POINTS: 4
+NUM_ENC_LAYERS: 6
+NUM_DEC_LAYERS: 6
+
+MERGE_DET_TRACK_LAYER: 1
+ACTIVATION: ReLU
+RETURN_INTER_DEC: True
+EXTRA_TRACK_ATTN: False
+AUX_LOSS: True
+
+USE_DAB: True
+UPDATE_THRESH: 0.5
+LONG_MEMORY_LAMBDA: 0.01
+NUM_DET_QUERIES: 300          # 保持一致
+
+# =================================================
+# 5. 预训练权重 (生死攸关)
+# =================================================
+# 【!!!请修改!!!】 必须指向你那个 MOTA 0.89 的最佳权重文件
+# 绝对不要填 DanceTrack 的权重！
+PRETRAINED_MODEL: '/nfs_B/LiaoYangHao/MeMOTR_output/memotr_dancetrack/checkpoint_119.pth'
+
+# Sampling setting
+
+SAMPLE_STEPS: [30,50]           # 在训练后期增加采样难度
+
+SAMPLE_LENGTHS: [2,3,4]     # 训练时采样的序列长度 resnet101 调整成2 记得改回来
+
+SAMPLE_MODES: [random_interval]
+
+SAMPLE_INTERVALS: [15, 30, 60]
+
+# =================================================
+# 6. 训练参数 (微调专用策略)
+# =================================================
+SEED: 0
+
+# [策略] 微调只需要少量 Epoch 让模型适应新环境
+EPOCHS: 20                    
+
+ONLY_TRAIN_QUERY_UPDATER_AFTER: 20
+DROPOUT: 0.1
+
+TP_DROP_RATE: 0.0
+FP_INSERT_RATE: 0.0
+
+# =================================================
+# 7. 优化器 (微调专用策略)
+# =================================================
+# [策略] 学习率整体降低 10 倍，防止破坏原有知识
+LR: 2.0e-5                    # 原 2.0e-4 -> 2.0e-5
+LR_BACKBONE: 2.0e-6           # 原 2.0e-5 -> 2.0e-6
+LR_POINTS: 2.0e-6             # 原 2.0e-5 -> 2.0e-6
+
+WEIGHT_DECAY: 0.0002
+CLIP_MAX_NORM: 0.1
+
+LR_SCHEDULER: MultiStep
+LR_DROP_RATE: 0.1
+# [策略] 在第 10 轮下降学习率，后 10 轮进行精细收敛
+LR_DROP_MILESTONES: [10]
+
+# =================================================
+# 8. Loss 权重 (保持 Scheme A 原样)
+# =================================================
+# 保持一致，证明是模型架构的通用性
+MATCH_COST_CLASS: 2
+MATCH_COST_BBOX: 10
+MATCH_COST_GIOU: 5
+
+LOSS_WEIGHT_FOCAL: 2
+LOSS_WEIGHT_L1: 5
+LOSS_WEIGHT_GIOU: 2
+
+AUX_LOSS_WEIGHT: [1.0, 1.0, 1.0, 1.0, 1.0]
+
+# [核心] Bio-Motion Loss 保持原有权重
+LOSS_WEIGHT_BIO: 1
