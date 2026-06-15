@@ -13,6 +13,11 @@ conda create -n wavemambatrack python=3.10
 conda activate wavemambatrack
 
 pip install -r requirements.txt
+
+Install Mamba State Space Model (mamba-ssm):
+
+pip install causal-conv1d
+pip install mamba-ssm
 ```
 
 ---
